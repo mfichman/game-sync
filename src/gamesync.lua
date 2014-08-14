@@ -33,6 +33,8 @@ local insert = table.insert
 gs.Channels = {}
 gs.Channels.__index = gs.Channels
 
+-- Creates a new channel.  A channel keeps track of the list of output sockets
+-- to write to and also keeps track of the input socket.
 function gs.Channels.new()
     local self = {}
     setmetatable(self, gs.Channels)
@@ -41,76 +43,99 @@ function gs.Channels.new()
     return self
 end
 
+-- The gs.Metatable table recursively overrides the __newindex metamethod. 
+-- Whenever __newindex is called, the gs library attempts to serialize the 
+-- value that was set.
+gs.Metatable = {}
+gs.Metatable.__index = gs.Metatable
+
+
+-- Creates a new Metatable.  The Metatable for a gamesync table intercepts the
+-- index and newindex events, writes to the underlying data table instead, 
+-- and then serializes the write to the network if necessary.
+function gs.Metatable.new(table, channels)
+    local self = {}
+    setmetatable(self, gs.Metatable)
+    self.channels = channels
+    self.dirty = {}
+    self.data = {}
+    self.id = gs.next_id
+    gs.next_id = gs.next_id+1
+
+    local mt = {}
+
+    function mt:__newindex(key, value)
+        return self:newindex(key, value) 
+    end
+    
+    function mt:__index(key)
+        return self:index(key)
+    end
+
+    setmetatable(table, self)
+    return self
+end
+
 -- Serialize a value on all output channels if possible.  Add table to the
 -- serialize list if there's no space in the output buffer.
-function gs.Channels:send(table, key, value)
-    for _, sd in ipairs(self.output) do
-        print('send', table._id, key, value)
-        gsn.begin_msg(sd.sd)
-        gsn.send_id(sd.sd, table._id)
+function gs.Metatable:send(key, value)
+    for _, sd in ipairs(self.channels.output) do
+        gsn.send_begin(sd.sd)
+        gsn.send_id(sd.sd, self.id)
         gsn.send_str(sd.sd, key) -- FIXME: Use an Atom table instead
+
         if type(value) == 'string' then
             gsn.send_typeid(sd.sd, string.byte('s'))
             gsn.send_str(sd.sd, value)  
+            print('send', self.id, 's', key, value)
         elseif type(value) == 'number' then
             gsn.send_typeid(sd.sd, string.byte('n'))
             gsn.send_num(sd.sd, value)
+            print('send', self.id, 'n', key, value)
         elseif type(value) == 'table' then
             gsn.send_typeid(sd.sd, string.byte('t'))
-            gsn.send_id(sd.sd, value._id)
+            gsn.send_id(sd.sd, value.id)
+            print('send', self.id, 't', key, value)
         elseif type(value) == 'boolean' then
             gsn.send_typeid(sd.sd, string.byte('b'))
             gsn.send_bool(sd.sd, value)
+            print('send', self.id, 'b', key, value)
         else
-            assert(false, 'invalid type')
+            error('invalid type')
         end
-        if not gsn.end_msg(sd.sd) then
+        if not gsn.send_end(sd.sd) then
             -- Not enough space. Add the table to the wait list 
-            table.insert(sd.sd.dirty, table)
+            insert(sd.dirty, table)
         end
         gsn.send(sd.sd)
     end
 end
 
 
--- The gs.Metatable table recursively overrides the __newindex metamethod. 
--- Whenever __newindex is called, the gs library attempts to serialize the 
--- value that was set.
-gs.Metatable = {}
 
--- Creates a new Metatable.  The Metatable for a gamesync table intercepts the
--- index and newindex events, writes to the underlying data table instead, 
--- and then serializes the write to the network if necessary.
-function gs.Metatable.new()
-    local data = {}
-    local mt = {}
-
-    -- Check if the write is idempotent.  If not, serialize the write.
-    function mt:__newindex(key, value)
-        if rawget(data, key) == value then
-            return
-        end
-        rawset(data, key, value)
-        if key:sub(1,1) == '_' then
-            return
-        end
-        if type(value) == 'table' then
-            setmetatable(value, gs.Metatable.new()) 
-            value._channels = self._channels
-            if value._id == nil then
-                value._id = gs.next_id
-                gs.next_id = gs.next_id + 1
-            end
-        end
-        self._channels:send(self, key, value)
+-- Called when a user data table is changed.  Check if the write is idempotent.
+-- If not, serialize the write.
+function gs.Metatable:__newindex(key, value)
+    if rawget(self.data, key) == value then
+        return
     end
-    
-    -- Return the value stored in the backing data table.
-    function mt:__index(key, value)
-        return rawget(data, key, value)
+    rawset(self.data, key, value)
+    if key:sub(1,1) == '_' then
+        return
     end
+    if type(value) == 'table' then
+        gs.Metatable.new(value, channels)
+    end
+    self:send(key, value)
+end
 
-    return mt
+-- Return the value stored in the backing data table.
+function gs.Metatable:__index(key)
+    if key == 'id' then
+        return self.id
+    else
+        return rawget(self.data, key)
+    end
 end
 
 
@@ -161,7 +186,8 @@ end
 -- again later when more bytes are available. 
 function gs.Socket:recv()
     local sd = self.sd
-    gsn.begin_msg(sd)
+    gsn.recv_begin(sd)
+
     local id = gsn.recv_id(sd)
     local key = gsn.recv_str(sd)
     local typeid = string.char(gsn.recv_typeid(sd)) 
@@ -175,15 +201,20 @@ function gs.Socket:recv()
         value = self.table[tableid]
         if not value then
             value = {}
-            value._channels = gs.Channels.new()
-            value._id = tableid
+            local channels = gs.Channels.new()
+            gs.Metatable.new(value, channels, tableid)
             self.table[tableid] = value
         end
-        insert(value._channels.output, sd)
+        insert(channels.output, sd)
     elseif typeid == 'b' then
         value = gsn.recv_boolean(sd)
+    elseif typeid == '\0' then
+        -- Socket is possibly borked
+    else
+        error('invalid typeid')
     end
-    if not gsn.end_msg(sd) then
+    
+    if not gsn.recv_end(sd) then
         return -- Couldn't read the whole message
     end
     local table = self.table[id]
@@ -243,11 +274,9 @@ function gs.open(src)
         return nil, 'error: already open'
     end
 
+    local channels = gs.Channels.new()
     local table = {}
-    table._channels = gs.Channels.new()
-    table._id = gs.next_id
-    gs.next_id = gs.next_id + 1
-    setmetatable(table, gs.Metatable.new())
+    local mt = gs.Metatable.new(table, channels)
     gs.table[path] = table
     
     if scheme == 'local' then
@@ -262,8 +291,8 @@ function gs.open(src)
             sd.port = port
             sd:connect(host, port)
             gs.socket[name] = sd
-            insert(table._channels.output, sd)
-            table._channels:send(gs.table, path, table)
+            insert(channels.output, sd)
+            mt:send(path, table)
         end
     else
         return nil, 'error: bad scheme'

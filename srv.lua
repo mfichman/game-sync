@@ -6,12 +6,14 @@ while true do
     gs.poll(true)
     tab = gs.table['/foo/bar']
     if tab then
-        print(tab)
-        for k, v in pairs(tab) do
-            print(k, v)
+        if tab.y then
+        print(tab.y.z)
         end
-        print('output', #tab._channels.output)
+        for k, v in pairs(tab) do
+            if not k:match('_.*') then
+         --       print(k, v)
+            end
+        end
     end
-    print()
 end
 

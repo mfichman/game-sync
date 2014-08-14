@@ -36,6 +36,8 @@
 #define ECONNREFUSED WSAECONNREFUSED
 #define EHOSTUNREACH WSAEHOSTUNREACH
 #define EWOULDBLOCK WSAEWOULDBLOCK
+#define EADDRINUSE WSAEADDRINUSE
+#define EOK ERROR_SUCCESS
 #else
 #endif
 
@@ -50,6 +52,7 @@ typedef enum gs_SocketState {
     gs_connecting,
     gs_listening,
     gs_closed,
+    gs_error,
 } gs_SocketState;
 
 typedef int gs_Flags;
@@ -64,15 +67,24 @@ typedef struct gs_Socket {
     gs_SocketState state; /* socket state */
     gs_Flags flags;
     char write_buf[gs_bufsize];
-    char* write_ptr;
-    char* write_start;
-    char* write_checkpoint;
+    char* write_ptr; /* pointer to end of area user has written */
+    char* write_start; /* pointer to end of area socket has read */
+    char* write_checkpoint; 
     char read_buf[gs_bufsize];
-    char* read_ptr;
-    char* read_end;
+    char* read_ptr; /* pointer to end of area user  has read */
+    char* read_end; /* pointer to end of area socket has sent */
     char* read_checkpoint;
 } gs_Socket;
 
+
+static void gs_push_error(DWORD error) {
+    char buffer[1024];
+    memset(buffer, 0, sizeof(buffer));
+    LPSTR buf = (LPSTR)buffer;
+    DWORD flags = FORMAT_MESSAGE_FROM_SYSTEM;
+    DWORD len = FormatMessage(flags, 0, error, 0, buf, sizeof(buffer)-1, 0);
+    printf("%s\n", buffer);
+}
 
 /* CONNECTION MANAGEMENT */
 
@@ -91,8 +103,18 @@ static gs_Socket* gs_socket() {
     sd->write_start = sd->write_buf;
     sd->read_ptr = sd->read_buf;
     sd->read_end = sd->read_buf;
+    assert(!sd->status);
     assert(!ioctlsocket(sd->sd, FIONBIO, &yes));
     return sd;
+}
+
+/* Closes the socket connection */
+static void gs_close(gs_Socket* sd) {
+    int ret = closesocket(sd->sd);
+    sd->status = ret < 0 ? errno : 0;
+    sd->state = gs_closed;
+    assert(!sd->status);
+    free(sd);
 }
 
 /* Connects to the given addr/port, and resumes the given coroutine when the
@@ -107,22 +129,15 @@ static void gs_connect(gs_Socket* sd, char const* addr, uint16_t port) {
     sin.sin_family = AF_INET;
     ret = connect(sd->sd, (struct sockaddr*)&sin, sizeof(sin));
     sd->status = ret < 0 ? errno : 0;
-    sd->state = gs_connecting;
 
-    if (sd->status == ECONNREFUSED) {
-    } else if(sd->status == EHOSTUNREACH) {
-    } else if(sd->status == EWOULDBLOCK) {
-    } else {
+    switch (sd->status) {
+    case ECONNREFUSED: sd->state = gs_error; break;
+    case EHOSTUNREACH: sd->state = gs_error; break;
+    case EWOULDBLOCK: sd->state = gs_connecting; break;
+    default:
         assert(!"bad return status");
+        break;
     }
-}
-
-/* Closes the socket connection */
-static void gs_close(gs_Socket* sd) {
-    int ret = closesocket(sd->sd);
-    sd->status = ret < 0 ? errno : 0;
-    sd->state = gs_closed;
-    free(sd);
 }
 
 /* Sets the listen port for the socket */
@@ -137,13 +152,18 @@ static void gs_listen(gs_Socket* sd, uint16_t port) {
 
     ret = bind(sd->sd, (struct sockaddr*)&sin, sizeof(sin));
     sd->status = ret < 0 ? errno : 0;
-    if (ret < 0) {
-        return;
+
+    switch (sd->status) {
+    case EADDRINUSE: sd->state = gs_error; return;
+    case EOK: break; 
+    default:
+        assert(!"bad return status");
     }
 
     ret = listen(sd->sd, backlog);
     sd->status = ret < 0 ? errno : 0;
     sd->state = gs_listening;
+    assert(!sd->status);
 }
 
 /* Accepts incoming connections */
@@ -163,14 +183,26 @@ static gs_Socket* gs_accept(gs_Socket* sd) {
 
 /* SERIALIZATION/DESERIALIZATION */
 
-static void gs_begin_msg(gs_Socket* sd) {
+static void gs_send_begin(gs_Socket* sd) {
     sd->write_checkpoint = sd->write_ptr;
+}
+
+static void gs_recv_begin(gs_Socket* sd) {
     sd->read_checkpoint = sd->read_ptr;
 }
 
-static int gs_end_msg(gs_Socket* sd) {
-    if (sd->write_checkpoint || sd->read_checkpoint) {
+static int gs_send_end(gs_Socket* sd) {
+    if (sd->write_checkpoint) {
         sd->write_checkpoint = 0;
+        return 1; // ok, committed
+    } else {
+        sd->write_checkpoint = 0;
+        return 0;
+    }
+}
+
+static int gs_recv_end(gs_Socket* sd) {
+    if (sd->read_checkpoint) {
         sd->read_checkpoint = 0;
         if (sd->read_ptr == sd->read_end) {
             sd->read_ptr = sd->read_buf;
@@ -178,7 +210,6 @@ static int gs_end_msg(gs_Socket* sd) {
         }
         return 1; // ok, committed
     } else {
-        sd->write_checkpoint = 0;
         sd->read_checkpoint = 0;
         return 0;
     }
@@ -220,10 +251,13 @@ static void gs_send(gs_Socket* sd) {
     ret = send(sd->sd, sd->write_start, len, 0);
     if (ret < 0) {
         sd->status = errno;
-        printf("send fail\n");
+        sd->state = gs_error;
+        if (!sd->write_checkpoint) {
+            sd->write_ptr = sd->write_checkpoint;
+            sd->write_checkpoint = 0;
+        }
     } else {
         sd->write_start += len;
-        printf("send %d bytes\n", len);
     }
     if (sd->write_start == sd->write_ptr) {
         sd->write_start = sd->write_buf;
@@ -280,10 +314,13 @@ static void gs_recv(gs_Socket* sd) {
     int ret = recv(sd->sd, sd->read_end, len, 0);
     if (ret < 0) {
         sd->status = errno;
-        printf("recv fail\n");
+        sd->state = gs_error;
+        if (!sd->read_checkpoint) {
+            sd->read_ptr = sd->read_checkpoint;
+            sd->read_checkpoint = 0;
+        }
     } else {
         sd->read_end += ret;
-        printf("recv %d bytes\n", ret);
     }
 }
 
@@ -392,16 +429,20 @@ static int gs_Lpoll(lua_State* env) {
         sd = lua_touserdata(env, -1);
         sd->flags = 0;
         lua_pop(env, 2);
-        FD_SET(sd->sd, &rdfds);
-        FD_SET(sd->sd, &exfds);
         nfds = max(nfds, sd->sd);
-        if (sd->write_ptr != sd->write_buf) {
+
+        if (sd->state != gs_error) {
+            FD_SET(sd->sd, &rdfds);
+            FD_SET(sd->sd, &exfds);
+        }
+        if (sd->state == gs_error) {
+            // Skip 
+        } else if (sd->write_ptr != sd->write_buf) {
             FD_SET(sd->sd, &wrfds);
         } else if (sd->state == gs_connecting) {
             FD_SET(sd->sd, &wrfds);
         }
     }
-    printf("wait=%d\n", wait);
     select(nfds+1, &rdfds, &wrfds, &exfds, wait ? 0 : &tv);
 
     lua_pushnil(env);
@@ -427,16 +468,31 @@ static int gs_Lpoll(lua_State* env) {
     return 0;
 }
 
-static int gs_Lbegin_msg(lua_State* env) {
+static int gs_Lsend_begin(lua_State* env) {
     gs_Socket* sd = lua_touserdata(env, 1);
-    gs_begin_msg(sd);
+    gs_send_begin(sd);
     lua_settop(env, 0);
     return 0;
 }
 
-static int gs_Lend_msg(lua_State* env) {
+static int gs_Lrecv_begin(lua_State* env) {
     gs_Socket* sd = lua_touserdata(env, 1);
-    int ret = gs_end_msg(sd);
+    gs_recv_begin(sd);
+    lua_settop(env, 0);
+    return 0;
+}
+
+static int gs_Lsend_end(lua_State* env) {
+    gs_Socket* sd = lua_touserdata(env, 1);
+    int ret = gs_send_end(sd);
+    lua_settop(env, 0);
+    lua_pushboolean(env, ret);
+    return 1;
+}
+
+static int gs_Lrecv_end(lua_State* env) {
+    gs_Socket* sd = lua_touserdata(env, 1);
+    int ret = gs_recv_end(sd);
     lua_settop(env, 0);
     lua_pushboolean(env, ret);
     return 1;
@@ -578,6 +634,9 @@ static int gs_Lstate(lua_State* env) {
     case gs_closed:
         lua_pushstring(env, "closed");
         break;
+    case gs_error:
+        lua_pushstring(env, "error");
+        break;
     default:
         lua_pushstring(env, "");
         break;
@@ -592,8 +651,10 @@ static const luaL_reg gamesync[] = {
     { "listen", gs_Llisten },
     { "accept", gs_Laccept },
     { "poll", gs_Lpoll },
-    { "begin_msg", gs_Lbegin_msg },
-    { "end_msg", gs_Lend_msg },
+    { "send_begin", gs_Lsend_begin },
+    { "send_end", gs_Lsend_end },
+    { "recv_begin", gs_Lrecv_begin },
+    { "recv_end", gs_Lrecv_end },
     { "status", gs_Lstatus },
     { "writable", gs_Lwritable },
     { "readable", gs_Lreadable },

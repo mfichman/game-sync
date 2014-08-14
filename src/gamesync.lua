@@ -18,7 +18,7 @@
 -- FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 -- IN THE SOFTWARE.
 
-gsn = require('gamesyncnative')
+local gsn = require('lib.gamesync')
 
 local gs = {}
 gs.socket = {} -- array of sockets
@@ -45,61 +45,31 @@ end
 -- serialize list if there's no space in the output buffer.
 function gs.Channels:send(table, key, value)
     for _, sd in ipairs(self.output) do
-        gsn.begin(sd.sd)
+        print('send', table._id, key, value)
+        gsn.begin_msg(sd.sd)
         gsn.send_id(sd.sd, table._id)
         gsn.send_str(sd.sd, key) -- FIXME: Use an Atom table instead
         if type(value) == 'string' then
-            gsn.send_typeid(sd.sd, 's')
+            gsn.send_typeid(sd.sd, string.byte('s'))
             gsn.send_str(sd.sd, value)  
         elseif type(value) == 'number' then
-            gsn.send_typeid(sd.sd, 'n')
+            gsn.send_typeid(sd.sd, string.byte('n'))
             gsn.send_num(sd.sd, value)
         elseif type(value) == 'table' then
-            gsn.send_typeid(sd.sd, 't')
+            gsn.send_typeid(sd.sd, string.byte('t'))
             gsn.send_id(sd.sd, value._id)
         elseif type(value) == 'boolean' then
-            gsn.send_typeid(sd.sd, 'b')
+            gsn.send_typeid(sd.sd, string.byte('b'))
             gsn.send_bool(sd.sd, value)
         else
             assert(false, 'invalid type')
         end
-        if not gsn.commit(sd.sd) then
+        if not gsn.end_msg(sd.sd) then
             -- Not enough space. Add the table to the wait list 
             table.insert(sd.sd.dirty, table)
         end
+        gsn.send(sd.sd)
     end
-end
-
--- Receive a message from the socket.  If the whole message can't be read, try
--- again later when more bytes are available. 
-function gs.Channels:recv()
-    local sd = self.input
-    local id = gsn.recv_id(sd.sd)
-    local key = gsn.recv_str(sd.sd)
-    local typeid = gsn.recv_typeid(sd.sd) 
-    local value
-    if typeid == 's' then
-        value = gsn.recv_str(sd.sd) 
-    elseif typeid == 'n' then
-        value = gsn.recv_num(sd.sd)
-    elseif typeid == 't' then
-        local tableid = gsn.recv_id(sd.sd)
-        value = sd.table[tableid]
-        if not value then
-            value = { _id = tableid }
-            sd.table[tableid] = value
-        end
-    elseif typeid == 'b' then
-        value = gsn.recv_boolean(sd.sd)
-    else
-        assert(false, 'invalid type')
-    end
-    if gsn.consume() then
-        return -- Couldn't read the whole message
-    end
-    local table = sd.table[id]
-    assert(table, 'unknown table id #'..id)
-    table[key] = value
 end
 
 
@@ -108,25 +78,41 @@ end
 -- value that was set.
 gs.Metatable = {}
 
--- Attach a metatable to the nested table if necessary, and send the update 
--- if the table is connected.
-function gs.Metatable:__newindex(key, value)
-    rawset(self, key, value)
-    if key:sub(1,1) == '_' then
-        return
+-- Creates a new Metatable.  The Metatable for a gamesync table intercepts the
+-- index and newindex events, writes to the underlying data table instead, 
+-- and then serializes the write to the network if necessary.
+function gs.Metatable.new()
+    local data = {}
+    local mt = {}
+
+    -- Check if the write is idempotent.  If not, serialize the write.
+    function mt:__newindex(key, value)
+        if rawget(data, key) == value then
+            return
+        end
+        rawset(data, key, value)
+        if key:sub(1,1) == '_' then
+            return
+        end
+        if type(value) == 'table' then
+            setmetatable(value, gs.Metatable.new()) 
+            value._channels = self._channels
+            if value._id == nil then
+                value._id = gs.next_id
+                gs.next_id = gs.next_id + 1
+            end
+        end
+        self._channels:send(self, key, value)
+    end
+    
+    -- Return the value stored in the backing data table.
+    function mt:__index(key, value)
+        return rawget(data, key, value)
     end
 
-    print(self, key, value)
-    if type(value) == 'table' then
-        setmetatable(value, gs.Metatable) 
-        value._channels = self._channels
-        if value._id == nil then
-            value._id = gs.next_id
-            gs.next_id = gs.next_id + 1
-        end
-    end
-    self._channels:send(self, key, value)
+    return mt
 end
+
 
 -- The gs.Socket table keeps a connection up so that tables stay in-sync,
 -- and reconnects if necessary.
@@ -170,6 +156,42 @@ function gs.Socket:close()
     gsn.close(self.sd)
     self.sd = nil
 end
+
+-- Receive a message from the socket.  If the whole message can't be read, try
+-- again later when more bytes are available. 
+function gs.Socket:recv()
+    local sd = self.sd
+    gsn.begin_msg(sd)
+    local id = gsn.recv_id(sd)
+    local key = gsn.recv_str(sd)
+    local typeid = string.char(gsn.recv_typeid(sd)) 
+    local value
+    if typeid == 's' then
+        value = gsn.recv_str(sd) 
+    elseif typeid == 'n' then
+        value = gsn.recv_num(sd)
+    elseif typeid == 't' then
+        local tableid = gsn.recv_id(sd)
+        value = self.table[tableid]
+        if not value then
+            value = {}
+            value._channels = gs.Channels.new()
+            value._id = tableid
+            self.table[tableid] = value
+        end
+        insert(value._channels.output, sd)
+    elseif typeid == 'b' then
+        value = gsn.recv_boolean(sd)
+    end
+    if not gsn.end_msg(sd) then
+        return -- Couldn't read the whole message
+    end
+    local table = self.table[id]
+    assert(table, 'unknown table id #'..id)
+    table[key] = value
+    print('recv', id, typeid, key, value)
+end
+
 
 -- Parse a URI and return the hostname, port, and path
 function gs.uri(uri) 
@@ -225,7 +247,7 @@ function gs.open(src)
     table._channels = gs.Channels.new()
     table._id = gs.next_id
     gs.next_id = gs.next_id + 1
-    setmetatable(table, gs.Metatable)
+    setmetatable(table, gs.Metatable.new())
     gs.table[path] = table
     
     if scheme == 'local' then
@@ -260,25 +282,29 @@ function gs.close(src)
 
 end
 
-function gs.poll() 
-    gsn.poll(gs.socket)
+function gs.poll(wait) 
+    local newsockets = {}
+    gsn.poll(gs.socket, wait)
     for _, sd in pairs(gs.socket) do
         --if gsn.status(sd.sd) ~= 0 then
         --    sd:connect(sd.host, sd.port)
         if gsn.state(sd.sd) == 'listening' then
             if gsn.readable(sd.sd) then
                 local ret = sd:accept()  
-                gs.socket[ret] = ret 
-                print(sd)
+                insert(newsockets, ret)
             end
         else
             if gsn.writable(sd.sd) then
-                print('writable', sd)
+                gsn.send(sd.sd)
             end
             if gsn.readable(sd.sd) then
-                print('readable', sd)
+                gsn.recv(sd.sd)
+                sd:recv()
             end
         end
+    end
+    for k, sd in ipairs(newsockets) do
+        gs.socket[sd] = sd
     end
 end
 

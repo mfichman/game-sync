@@ -1,4 +1,3 @@
-gs = require('gamesync')
-
+gs = require('src.gamesync')
 tab = gs.open('gs://127.0.0.1:8000/foo/bar')
-gs.poll()
+--gs.poll(1)

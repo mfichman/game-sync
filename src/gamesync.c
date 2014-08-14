@@ -65,7 +65,12 @@ typedef struct gs_Socket {
     gs_Flags flags;
     char write_buf[gs_bufsize];
     char* write_ptr;
-    char* begin;
+    char* write_start;
+    char* write_checkpoint;
+    char read_buf[gs_bufsize];
+    char* read_ptr;
+    char* read_end;
+    char* read_checkpoint;
 } gs_Socket;
 
 
@@ -83,6 +88,9 @@ static gs_Socket* gs_socket() {
     sd->state = gs_nil;
     sd->flags = 0;
     sd->write_ptr = sd->write_buf;
+    sd->write_start = sd->write_buf;
+    sd->read_ptr = sd->read_buf;
+    sd->read_end = sd->read_buf;
     assert(!ioctlsocket(sd->sd, FIONBIO, &yes));
     return sd;
 }
@@ -146,67 +154,96 @@ static gs_Socket* gs_accept(gs_Socket* sd) {
     ret->status = sd->sd < 0 ? errno : 0;
     ret->state = gs_idle;
     ret->write_ptr = ret->write_buf;
+    ret->write_start = ret->write_buf;
+    ret->read_ptr = ret->read_buf;
+    ret->read_end = ret->read_buf;
     assert(!ioctlsocket(ret->sd, FIONBIO, &yes));
     return ret;
 }
 
 /* SERIALIZATION/DESERIALIZATION */
 
-static void gs_begin(gs_Socket* sd) {
-    sd->begin = sd->write_ptr;
+static void gs_begin_msg(gs_Socket* sd) {
+    sd->write_checkpoint = sd->write_ptr;
+    sd->read_checkpoint = sd->read_ptr;
 }
 
-static int gs_commit(gs_Socket* sd) {
-    if (sd->begin) {
-        printf("committed %d bytes\n", sd->write_ptr-sd->begin);
-        sd->begin = 0;
+static int gs_end_msg(gs_Socket* sd) {
+    if (sd->write_checkpoint || sd->read_checkpoint) {
+        sd->write_checkpoint = 0;
+        sd->read_checkpoint = 0;
+        if (sd->read_ptr == sd->read_end) {
+            sd->read_ptr = sd->read_buf;
+            sd->read_end = sd->read_buf;
+        }
         return 1; // ok, committed
     } else {
+        sd->write_checkpoint = 0;
+        sd->read_checkpoint = 0;
         return 0;
     }
 }
 
+/* Checks to see if 'len' bytes are available in the write buffer */
 static int gs_reserve(gs_Socket* sd, uint32_t len) {
-    if (!sd->begin) {
+    if (!sd->write_checkpoint) {
         return 0; /* aborted previously, or forgot to call begin() */
     } else if ((sd->write_buf + sizeof(sd->write_buf) - sd->write_ptr) < len) {
-        sd->write_ptr = sd->begin; 
-        sd->begin = 0;
+        sd->write_ptr = sd->write_checkpoint; 
+        sd->write_checkpoint = 0;
         return 0; /* not enough space */
     } else {
         return 1; /* good to go */
     }
 }
 
-static int gs_send_int(gs_Socket* sd, int32_t num) {
-    if (!gs_reserve(sd, sizeof(num))) {
-        return 0;
+/* Checks to see if 'len' bytes are available to read in the read buffer */
+static int gs_check(gs_Socket* sd, uint32_t len) {
+    if (!sd->read_checkpoint) {
+        return 0; /* aborted previously on read */
+    } else if ((sd->read_end - sd->read_ptr) < len) {
+        sd->read_ptr = sd->read_checkpoint;
+        sd->read_checkpoint = 0;
+        return 0; /* not enough data in the buffer */
+    } else {
+        return 1; /* good to go */
     }
-    num = htonl(num);
-    memcpy(sd->write_ptr, &num, sizeof(num));
-    sd->write_ptr += sizeof(num);
-    return 1;
 }
 
-static int gs_send_double(gs_Socket* sd, double num) {
-    if (!gs_reserve(sd, sizeof(num))) {
-        return 0;
+/* Send to the remote side */
+static void gs_send(gs_Socket* sd) {
+    int len = sd->write_ptr - sd->write_start;
+    int ret = 0;
+    if (!len) {
+        return;
+    } 
+    ret = send(sd->sd, sd->write_start, len, 0);
+    if (ret < 0) {
+        sd->status = errno;
+        printf("send fail\n");
+    } else {
+        sd->write_start += len;
+        printf("send %d bytes\n", len);
     }
-    memcpy(sd->write_ptr, &num, sizeof(num));
-    sd->write_ptr += sizeof(num);
-    return 1;
+    if (sd->write_start == sd->write_ptr) {
+        sd->write_start = sd->write_buf;
+        sd->write_ptr = sd->write_buf;
+    }
 }
 
 static int gs_send_str(gs_Socket* sd, char const* str) {
     int32_t len = strlen(str);
-    if (!gs_send_int(sd, len)) {
+    int32_t netlen = htonl(len);
+    if (!gs_reserve(sd, sizeof(len))) {
         return 0;
     }
-    if (!gs_reserve(sd, len)) {
-        return 0;
-    }
-    memcpy(sd->write_ptr, str, len);
+    memcpy(sd->write_ptr, &netlen, sizeof(len));
     sd->write_ptr += sizeof(len);
+    if (!gs_reserve(sd, len+1)) {
+        return 0;
+    }
+    memcpy(sd->write_ptr, str, len+1);
+    sd->write_ptr += len+1;
     return 1;
 }
 
@@ -220,18 +257,83 @@ static int gs_send_typeid(gs_Socket* sd, gs_TypeId id) {
 }
 
 static int gs_send_id(gs_Socket* sd, gs_Id id) {
-    return gs_send_int(sd, id);
+    if (!gs_reserve(sd, sizeof(id))) {
+        return 0;
+    }
+    id = htonl(id);
+    memcpy(sd->write_ptr, &id, sizeof(id));
+    sd->write_ptr += sizeof(id);
+    return 1;
 }
 
 static int gs_send_num(gs_Socket* sd, lua_Number num) {
-    lua_Number whole = 0;
-    lua_Number fract = modf(num, &whole);
-    if (fract) {
-        return gs_send_double(sd, num);     
+    if (!gs_reserve(sd, sizeof(num))) {
+        return 0;
+    }
+    memcpy(sd->write_ptr, &num, sizeof(num));
+    sd->write_ptr += sizeof(num);
+    return 1;
+}
+
+static void gs_recv(gs_Socket* sd) {
+    int len = sd->read_buf + sizeof(sd->read_buf) - sd->read_end;
+    int ret = recv(sd->sd, sd->read_end, len, 0);
+    if (ret < 0) {
+        sd->status = errno;
+        printf("recv fail\n");
     } else {
-        return gs_send_int(sd, (int32_t)num);
+        sd->read_end += ret;
+        printf("recv %d bytes\n", ret);
     }
 }
+
+static char const* gs_recv_str(gs_Socket* sd) {
+    int32_t len = 0;
+    char const* str = 0;
+    if (!gs_check(sd, sizeof(len))) {
+        return 0;
+    }
+    memcpy(&len, sd->read_ptr, sizeof(len));
+    sd->read_ptr += sizeof(len);
+    len = ntohl(len);
+    if (!gs_check(sd, len+1)) {
+        return 0;
+    }
+    str = sd->read_ptr;
+    sd->read_ptr += len+1;
+    return str;
+}
+
+static gs_TypeId gs_recv_typeid(gs_Socket* sd) {
+    gs_TypeId id = 0;
+    if (!gs_check(sd, sizeof(id))) {
+        return 0;
+    }
+    memcpy(&id, sd->read_ptr, sizeof(id));
+    sd->read_ptr += sizeof(id);
+    return id;
+}
+
+static gs_Id gs_recv_id(gs_Socket* sd) {
+    gs_Id id = 0;
+    if (!gs_check(sd, sizeof(id))) {
+        return 0;
+    }
+    memcpy(&id, sd->read_ptr, sizeof(id));
+    sd->read_ptr += sizeof(id);
+    return ntohl(id);
+}
+
+static lua_Number gs_recv_num(gs_Socket* sd) {
+    lua_Number num = 0;
+    if (!gs_check(sd, sizeof(num))) {
+        return 0;
+    }
+    memcpy(&num, sd->read_ptr, sizeof(num));
+    sd->read_ptr += sizeof(num);
+    return num;
+}
+
 
 /* LUA BINDINGS */
 
@@ -272,6 +374,8 @@ static int gs_Laccept(lua_State* env) {
 }
 
 static int gs_Lpoll(lua_State* env) {
+    int wait = lua_toboolean(env, 2);
+    struct timeval tv = { 0, 0 };
     fd_set rdfds;
     fd_set wrfds;
     fd_set exfds;
@@ -297,7 +401,8 @@ static int gs_Lpoll(lua_State* env) {
             FD_SET(sd->sd, &wrfds);
         }
     }
-    select(nfds+1, &rdfds, &wrfds, &exfds, 0);
+    printf("wait=%d\n", wait);
+    select(nfds+1, &rdfds, &wrfds, &exfds, wait ? 0 : &tv);
 
     lua_pushnil(env);
     while (lua_next(env, 1) != 0) {
@@ -308,6 +413,9 @@ static int gs_Lpoll(lua_State* env) {
         lua_pop(env, 2);
         if (FD_ISSET(sd->sd, &wrfds)) {
             sd->flags |= gs_write;
+			if (sd->state == gs_connecting) {
+				sd->state = gs_idle;
+			}
         } else if (FD_ISSET(sd->sd, &exfds)) {
             sd->status = 1;
         } else if (FD_ISSET(sd->sd, &rdfds)) {
@@ -319,16 +427,16 @@ static int gs_Lpoll(lua_State* env) {
     return 0;
 }
 
-static int gs_Lbegin(lua_State* env) {
+static int gs_Lbegin_msg(lua_State* env) {
     gs_Socket* sd = lua_touserdata(env, 1);
-    gs_begin(sd);
+    gs_begin_msg(sd);
     lua_settop(env, 0);
     return 0;
 }
 
-static int gs_Lcommit(lua_State* env) {
+static int gs_Lend_msg(lua_State* env) {
     gs_Socket* sd = lua_touserdata(env, 1);
-    int ret = gs_commit(sd);
+    int ret = gs_end_msg(sd);
     lua_settop(env, 0);
     lua_pushboolean(env, ret);
     return 1;
@@ -375,6 +483,13 @@ static int gs_Lstrerror(lua_State* env) {
     }
 }
 
+static int gs_Lsend(lua_State* env) {
+    gs_Socket* sd = lua_touserdata(env, 1);
+    lua_settop(env, 0);
+    gs_send(sd);
+    return 0;
+}
+
 static int gs_Lsend_str(lua_State* env) {
     gs_Socket* sd = lua_touserdata(env, 1);
     char const* str = lua_tostring(env, 2);
@@ -385,9 +500,9 @@ static int gs_Lsend_str(lua_State* env) {
 
 static int gs_Lsend_typeid(lua_State* env) {
     gs_Socket* sd = lua_touserdata(env, 1);
-    char id = lua_tostring(env, 2)[0];
+    gs_TypeId id = (gs_TypeId)lua_tonumber(env, 2);
     assert(id == 'n' || id == 's' || id == 'b' || id == 't');
-    gs_send_typeid(sd, (gs_TypeId)id);
+    gs_send_typeid(sd, id);
     lua_settop(env, 0);
     return 0;
 }
@@ -407,6 +522,41 @@ static int gs_Lsend_num(lua_State* env) {
     gs_send_num(sd, num);
     lua_settop(env, 0);
     return 0;
+}
+
+static int gs_Lrecv(lua_State* env) {
+    gs_Socket* sd = lua_touserdata(env, 1);
+    lua_settop(env, 0);
+    gs_recv(sd);
+    return 0;
+}
+
+static int gs_Lrecv_str(lua_State* env) {
+    gs_Socket* sd = lua_touserdata(env, 1);
+    lua_settop(env, 0);
+    lua_pushstring(env, gs_recv_str(sd));
+    return 1; 
+}
+
+static int gs_Lrecv_typeid(lua_State* env) {
+    gs_Socket* sd = lua_touserdata(env, 1);
+    lua_settop(env, 0);
+    lua_pushnumber(env, gs_recv_typeid(sd));
+    return 1;
+}
+
+static int gs_Lrecv_id(lua_State* env) {
+    gs_Socket* sd = lua_touserdata(env, 1);
+    lua_settop(env, 0);
+    lua_pushnumber(env, gs_recv_id(sd));
+    return 1;
+}
+
+static int gs_Lrecv_num(lua_State* env) {
+    gs_Socket* sd = lua_touserdata(env, 1);
+    lua_settop(env, 0);
+    lua_pushnumber(env, gs_recv_num(sd));
+    return 1;
 }
 
 static int gs_Lstate(lua_State* env) {
@@ -442,21 +592,27 @@ static const luaL_reg gamesync[] = {
     { "listen", gs_Llisten },
     { "accept", gs_Laccept },
     { "poll", gs_Lpoll },
-    { "begin", gs_Lbegin },
-    { "commit", gs_Lcommit },
+    { "begin_msg", gs_Lbegin_msg },
+    { "end_msg", gs_Lend_msg },
     { "status", gs_Lstatus },
     { "writable", gs_Lwritable },
     { "readable", gs_Lreadable },
     { "state", gs_Lstate },
     { "strerror", gs_Lstrerror },
+    { "send", gs_Lsend },
     { "send_str", gs_Lsend_str },
     { "send_typeid", gs_Lsend_typeid },
     { "send_id", gs_Lsend_id },
     { "send_num", gs_Lsend_num },
+    { "recv", gs_Lrecv },
+    { "recv_str", gs_Lrecv_str },
+    { "recv_typeid", gs_Lrecv_typeid },
+    { "recv_id", gs_Lrecv_id },
+    { "recv_num", gs_Lrecv_num },
     { 0, 0 },
 };
 
-GAMESYNC_API luaopen_gamesyncnative(lua_State *env) {
+GAMESYNC_API luaopen_lib_gamesync(lua_State *env) {
     lua_newtable(env);
     luaL_register(env, 0, gamesync);
     return 1;

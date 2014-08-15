@@ -8,7 +8,8 @@ class Gamesync(pkgboot.Package):
     ]
     libs = [
         pkgboot.Lib('ws2_32', 'win32'),
-        'lua51',
+		pkgboot.Lib('lua51', 'win32'),
+        'luajit-5.1',
     ]
     major_version = '0'
     minor_version = '0'

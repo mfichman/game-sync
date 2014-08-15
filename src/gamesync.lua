@@ -62,17 +62,19 @@ function gs.Metatable.new(table, channels)
     self.id = gs.next_id
     gs.next_id = gs.next_id+1
 
+	assert(channels)
+
     local mt = {}
 
-    function mt:__newindex(key, value)
+    function mt.__newindex(table, key, value)
         return self:newindex(key, value) 
     end
     
-    function mt:__index(key)
+    function mt.__index(table, key)
         return self:index(key)
     end
 
-    setmetatable(table, self)
+    setmetatable(table, mt)
     return self
 end
 
@@ -115,7 +117,7 @@ end
 
 -- Called when a user data table is changed.  Check if the write is idempotent.
 -- If not, serialize the write.
-function gs.Metatable:__newindex(key, value)
+function gs.Metatable:newindex(key, value)
     if rawget(self.data, key) == value then
         return
     end
@@ -124,13 +126,13 @@ function gs.Metatable:__newindex(key, value)
         return
     end
     if type(value) == 'table' then
-        gs.Metatable.new(value, channels)
+        gs.Metatable.new(value, self.channels)
     end
     self:send(key, value)
 end
 
 -- Return the value stored in the backing data table.
-function gs.Metatable:__index(key)
+function gs.Metatable:index(key)
     if key == 'id' then
         return self.id
     else
@@ -202,10 +204,10 @@ function gs.Socket:recv()
         if not value then
             value = {}
             local channels = gs.Channels.new()
-            gs.Metatable.new(value, channels, tableid)
+            local mt = gs.Metatable.new(value, channels, tableid)
             self.table[tableid] = value
+            insert(channels.output, sd)
         end
-        insert(channels.output, sd)
     elseif typeid == 'b' then
         value = gsn.recv_boolean(sd)
     elseif typeid == '\0' then
@@ -317,10 +319,12 @@ function gs.poll(wait)
     for _, sd in pairs(gs.socket) do
         --if gsn.status(sd.sd) ~= 0 then
         --    sd:connect(sd.host, sd.port)
+        print(gsn.state(sd.sd))
         if gsn.state(sd.sd) == 'listening' then
             if gsn.readable(sd.sd) then
                 local ret = sd:accept()  
                 insert(newsockets, ret)
+                print('accept')
             end
         else
             if gsn.writable(sd.sd) then
@@ -328,6 +332,7 @@ function gs.poll(wait)
             end
             if gsn.readable(sd.sd) then
                 gsn.recv(sd.sd)
+                print('recv')
                 sd:recv()
             end
         end

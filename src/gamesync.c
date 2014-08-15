@@ -26,9 +26,12 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <assert.h>
+#include <math.h>
 #ifdef _WIN32
+#define GAMESYNC_API __declspec(dllexport)
 #define WIN32_LEAN_AND_MEAN
 #define VC_EXTRALEAN
+#define NOMINMAX
 #include <winsock2.h>
 #include <windows.h>
 #undef errno
@@ -38,13 +41,24 @@
 #define EWOULDBLOCK WSAEWOULDBLOCK
 #define EADDRINUSE WSAEADDRINUSE
 #define EOK ERROR_SUCCESS
+#define close closesocket
 #else
+#define GAMESYNC_API
+#define EOK 0
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
-#define GAMESYNC_API __declspec(dllexport)
 
 typedef uint32_t gs_Id;
 typedef uint8_t gs_TypeId;
+
+#define max(x,y) ((x)>(y)?(x):(y))
 
 typedef enum gs_SocketState {
     gs_nil,
@@ -77,24 +91,40 @@ typedef struct gs_Socket {
 } gs_Socket;
 
 
-static void gs_push_error(DWORD error) {
-    char buffer[1024];
+static char const* gs_strerror(int error) {
+#ifdef _WIN32
+    static char buffer[1024];
     memset(buffer, 0, sizeof(buffer));
     LPSTR buf = (LPSTR)buffer;
     DWORD flags = FORMAT_MESSAGE_FROM_SYSTEM;
     DWORD len = FormatMessage(flags, 0, error, 0, buf, sizeof(buffer)-1, 0);
-    printf("%s\n", buffer);
+	return buf;
+#else
+	return strerror(error);
+#endif
 }
 
 /* CONNECTION MANAGEMENT */
 
+/* Set common socket flags/connection control options */
+static void gs_setflags(gs_Socket* sd) {
+#ifdef _WIN32
+    assert(!ioctlsocket(sd->sd, FIONBIO, &yes));
+#else
+	int flags = fcntl(sd->sd, F_GETFL, 0);
+	assert(!fcntl(sd->sd, F_SETFL, flags | O_NONBLOCK));
+#endif
+}
+
 /* Creates a new socket */
 static gs_Socket* gs_socket() {
     gs_Socket* sd = calloc(sizeof(gs_Socket), 1);
+    int yes = 1;
+#ifdef _WIN32
     WORD version = MAKEWORD(2, 2);
     WSADATA data;
-    int yes = 1;
     WSAStartup(version, &data);
+#endif
     sd->sd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sd->status = sd < 0 ? errno : 0;
     sd->state = gs_nil;
@@ -104,13 +134,13 @@ static gs_Socket* gs_socket() {
     sd->read_ptr = sd->read_buf;
     sd->read_end = sd->read_buf;
     assert(!sd->status);
-    assert(!ioctlsocket(sd->sd, FIONBIO, &yes));
+	gs_setflags(sd);
     return sd;
 }
 
 /* Closes the socket connection */
 static void gs_close(gs_Socket* sd) {
-    int ret = closesocket(sd->sd);
+    int ret = close(sd->sd);
     sd->status = ret < 0 ? errno : 0;
     sd->state = gs_closed;
     assert(!sd->status);
@@ -134,7 +164,9 @@ static void gs_connect(gs_Socket* sd, char const* addr, uint16_t port) {
     case ECONNREFUSED: sd->state = gs_error; break;
     case EHOSTUNREACH: sd->state = gs_error; break;
     case EWOULDBLOCK: sd->state = gs_connecting; break;
+	case EINPROGRESS: sd->state = gs_connecting; break;
     default:
+		printf("%s\n", gs_strerror(sd->status));
         assert(!"bad return status");
         break;
     }
@@ -177,7 +209,7 @@ static gs_Socket* gs_accept(gs_Socket* sd) {
     ret->write_start = ret->write_buf;
     ret->read_ptr = ret->read_buf;
     ret->read_end = ret->read_buf;
-    assert(!ioctlsocket(ret->sd, FIONBIO, &yes));
+	gs_setflags(sd);
     return ret;
 }
 
@@ -374,6 +406,13 @@ static lua_Number gs_recv_num(gs_Socket* sd) {
 
 /* LUA BINDINGS */
 
+static int gs_Lstrerror(lua_State* env) {
+	int error = lua_tointeger(env, 1);
+    lua_settop(env, 0);
+    lua_pushstring(env, gs_strerror(error));
+	return 1;
+}
+
 static int gs_Lsocket(lua_State* env) {
     lua_settop(env, 0);
     lua_pushlightuserdata(env, gs_socket()); 
@@ -498,13 +537,6 @@ static int gs_Lrecv_end(lua_State* env) {
     return 1;
 }
 
-static int gs_Labort(lua_State* env) {
-    gs_Socket* sd = lua_touserdata(env, 1);
-    gs_abort(sd);
-    lua_settop(env, 0);
-    return 0;
-}
-
 static int gs_Lstatus(lua_State* env) {
     gs_Socket* sd = lua_touserdata(env, 1);
     lua_settop(env, 0);
@@ -524,19 +556,6 @@ static int gs_Lreadable(lua_State* env) {
     lua_settop(env, 0);
     lua_pushboolean(env, sd->flags & gs_read);
     return 1;
-}
-
-static int gs_Lstrerror(lua_State* env) {
-    gs_Socket* sd = lua_touserdata(env, 1);
-    char msg[1024];
-    DWORD flags = FORMAT_MESSAGE_FROM_SYSTEM;
-    lua_settop(env, 0);
-    if (FormatMessage(flags, 0, sd->status, 0, msg, sizeof(msg), 0)) {
-        lua_pushstring(env, msg);
-        return 1;
-    } else {
-        return 0;
-    }
 }
 
 static int gs_Lsend(lua_State* env) {
@@ -673,7 +692,7 @@ static const luaL_reg gamesync[] = {
     { 0, 0 },
 };
 
-GAMESYNC_API luaopen_lib_gamesync(lua_State *env) {
+GAMESYNC_API int luaopen_lib_gamesync(lua_State *env) {
     lua_newtable(env);
     luaL_register(env, 0, gamesync);
     return 1;

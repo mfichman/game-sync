@@ -4,17 +4,17 @@ tab.x = 100
 tab.y = {}
 tab.y.z = 99
 
+gs.poll(true)
+
+--[[
 while true do
     gs.poll(true)
---[[
     gs.atomic(function() 
         tab.x = 100
         tab.y = 20 
         tab.z = 100 => can block processing
     end)
-]]
 end
---[[
 
 server:
 /foo/bar

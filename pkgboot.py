@@ -163,6 +163,7 @@ class Package:
         else:
             assert not "Unknown build type"
         self.env.Append(CXXFLAGS='/W4 /WX /wd4100 /MD /EHsc /Zi /Gm /FS')
+        self.env.Append(CFLAGS='/W3 /WX /wd4100 /MD /EHsc /Zi /Gm /FS')
         if self.use_pch:
             self.env.Append(CXXFLAGS='/Fpbuild/Common.pch')
             self.env.Append(CXXFLAGS='/Yu%s' % self.pch_header)

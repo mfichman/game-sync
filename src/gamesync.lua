@@ -109,7 +109,7 @@ function gs.Metatable:send(key, value)
             -- Not enough space. Add the table to the wait list 
             insert(sd.dirty, table)
         end
-        gsn.send(sd.sd)
+        gsn.flush(sd.sd)
     end
 end
 
@@ -319,20 +319,22 @@ function gs.poll(wait)
     for _, sd in pairs(gs.socket) do
         --if gsn.status(sd.sd) ~= 0 then
         --    sd:connect(sd.host, sd.port)
+        --
         print(gsn.state(sd.sd))
         if gsn.state(sd.sd) == 'listening' then
             if gsn.readable(sd.sd) then
+                print('accept')
                 local ret = sd:accept()  
                 insert(newsockets, ret)
-                print('accept')
             end
         else
             if gsn.writable(sd.sd) then
+                print('writable')
                 gsn.send(sd.sd)
             end
             if gsn.readable(sd.sd) then
-                gsn.recv(sd.sd)
-                print('recv')
+                print('readable')
+                gsn.fetch(sd.sd)
                 sd:recv()
             end
         end
